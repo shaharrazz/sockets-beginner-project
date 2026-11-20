@@ -1,4 +1,3 @@
-                                server.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +16,7 @@ int main() {
 //create the socket
 // AF_INET = Ipv4 SOCK_STREAM = TCP
         server_fd = socket(AF_INET, SOCK_STREAM,0);
-        if (server_fd == 0){
+        if (server_fd < 0){
         perror("Socket failed");
         exit(EXIT_FAILURE);
         }
@@ -55,7 +54,7 @@ int main() {
                 close(server_fd);
                 exit(EXIT_FAILURE);
         }
-        printf("[+] Client connected to Bot Server!/n");
+        printf("[+] Client connected to Bot Server!\n");
 
 //loop for long conversation
         while (1){
@@ -94,7 +93,7 @@ int main() {
 //close the sockets
         close(new_socket);
         close(server_fd);
-        printf("[+] Connection closed./n");
+        printf("[+] Connection closed.\n");
 
         return 0;
 }

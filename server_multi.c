@@ -2,8 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include <arpa/inet.h>
-#include <pthread.h> //thread laibary
+#include <pthread.h> //thread library
 #include <time.h>
 #include <openssl/evp.h>
 
@@ -17,22 +18,37 @@
 
 #define VALID_USERNAME "shahar"
 #define SALT "c3k9_CyberSec2026!$"
-// SHA256("Secret123!" + "c3k9_CyberSec2026!$")
-//PASSWORD  Secret123!
+// SHA256(password + SALT)
 #define VALID_PASSWORD_HASH "d2447d916f9f2228fcff669ff3a52d4fb090751202233e2c8d20cc533c8d8cef"
 
 #define MAX_FAILED_ATTEMPTS 3
 #define LOCKOUT_TIME_SEC 30
+#define MAX_TRACKED_IPS 256
 
-int failed_attempts = 0;
-time_t lockout_start_time = 0;
+// per-IP brute-force tracking (one attacker can't lock out other users)
+typedef struct {
+        char ip[INET_ADDRSTRLEN];
+        int failed_attempts;
+        time_t lockout_start_time;
+} ip_record_t;
+
+ip_record_t ip_table[MAX_TRACKED_IPS];
+int ip_count = 0;
+int next_slot = 0; //when table is full, oldest slot is reused
 pthread_mutex_t auth_lock_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// info passed to each client thread
+typedef struct {
+        int sock;
+        char ip[INET_ADDRSTRLEN];
+        int port;
+} client_info_t;
 
 SSL_CTX *ssl_ctx = NULL;
 
-void computer_sha256_with_salt(const char *password, const char *salt, char output_hex[65]){
-        unsigned char hash[EVP_MAX_MD_SIZE]; //lock safe for threads
-        unsigned int hash_len; //lock safe for logging
+void compute_sha256_with_salt(const char *password, const char *salt, char output_hex[65]){
+        unsigned char hash[EVP_MAX_MD_SIZE];
+        unsigned int hash_len;
 
         char salted_input[256] = {0};//buffer to put the salt
 
@@ -51,18 +67,37 @@ void computer_sha256_with_salt(const char *password, const char *salt, char outp
         output_hex[64] = '\0';
 }
 
-
+// find the record of an IP, or create one. caller must hold auth_lock_mutex
+ip_record_t *get_ip_record(const char *ip){
+        for (int i = 0; i < ip_count; i++){
+                if (strcmp(ip_table[i].ip, ip) == 0){
+                        return &ip_table[i];
+                }
+        }
+        ip_record_t *rec;
+        if (ip_count < MAX_TRACKED_IPS){
+                rec = &ip_table[ip_count++];
+        } else {
+                rec = &ip_table[next_slot];
+                next_slot = (next_slot + 1) % MAX_TRACKED_IPS;
+        }
+        snprintf(rec->ip, sizeof(rec->ip), "%s", ip);
+        rec->failed_attempts = 0;
+        rec->lockout_start_time = 0;
+        return rec;
+}
 
 int active_clients = 0; //COUNTING CLIENTS
-pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER; //lock safe fot threads
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER; //lock safe for threads
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 //log function for thread
 void log_event(const char *level, const char *message){
         time_t now = time(NULL);
-        struct tm *t = localtime(&now);
+        struct tm t;
+        localtime_r(&now, &t); //thread safe version of localtime
         char time_str[64];
-        strftime(time_str, sizeof(time_str), "%y-%m-%d %H:%M:%S",t);
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &t);
 
         pthread_mutex_lock(&log_mutex);
 //print to screen
@@ -76,8 +111,8 @@ void log_event(const char *level, const char *message){
         pthread_mutex_unlock(&log_mutex);
 }
 
-// fuction to reset SSL
-SSL_CTX *create_ssl_contex(){
+// function to create SSL context
+SSL_CTX *create_ssl_context(){
         const SSL_METHOD *method = TLS_server_method();
         SSL_CTX *ctx = SSL_CTX_new(method);
         if (!ctx) {
@@ -85,11 +120,13 @@ SSL_CTX *create_ssl_contex(){
                 ERR_print_errors_fp(stderr);
                 exit(EXIT_FAILURE);
         }
+        //refuse old insecure protocols (SSLv3, TLS 1.0, TLS 1.1)
+        SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
         return ctx;
 }
 //server.crt server.key
 void configure_ssl_context(SSL_CTX *ctx){
-        //public address of SSL
+        //public certificate of server
         if (SSL_CTX_use_certificate_file(ctx, "server.crt", SSL_FILETYPE_PEM) <= 0){
                 ERR_print_errors_fp(stderr);
                 exit(EXIT_FAILURE);
@@ -102,23 +139,28 @@ void configure_ssl_context(SSL_CTX *ctx){
 }
 
 
-void *handle_client(void *client_socket_ptr){
-        int new_socket = *(int *)client_socket_ptr;
-        free(client_socket_ptr); //free memory for socket id
+void *handle_client(void *client_info_ptr){
+        client_info_t info = *(client_info_t *)client_info_ptr;
+        free(client_info_ptr); //free memory for client info
+        int new_socket = info.sock;
+
+        char peer[64]; //"ip:port" of the client, used in every log line
+        snprintf(peer, sizeof(peer), "%s:%d", info.ip, info.port);
+
+        char buffer[BUFFER_SIZE] = {0};
+        char log_buff[512];
 
         SSL *ssl = SSL_new(ssl_ctx);
         SSL_set_fd(ssl, new_socket);
-        //crypted hand shake
+        //encrypted hand shake
         if (SSL_accept(ssl) <= 0){
                 ERR_print_errors_fp(stderr);
-                log_event("WARNING:", "SSL Handshake failed with client.");
+                snprintf(log_buff, sizeof(log_buff), "TLS handshake failed with client %s", peer);
+                log_event("WARNING", log_buff);
                 SSL_free(ssl);
                 close(new_socket);
                 return NULL;
         }
-
-        char buffer[BUFFER_SIZE] = {0};
-        char log_buff[256];
 
         int message_count = 0;
         time_t window_start = time(NULL);
@@ -128,11 +170,11 @@ void *handle_client(void *client_socket_ptr){
 //updates when client connects
         pthread_mutex_lock(&clients_mutex);
         active_clients++;
-        snprintf(log_buff, sizeof(log_buff), "[Thread %ld] Client connected on sock %d. Active client>
- (long)pthread_self(), new_socket, active_clients);
+        snprintf(log_buff, sizeof(log_buff), "[Thread %lu] Secure TLS client %s connected on sock %d. Active clients: %d",
+                 (unsigned long)pthread_self(), peer, new_socket, active_clients);
         log_event("INFO", log_buff);
         pthread_mutex_unlock(&clients_mutex);
-        char *welcome_msg = "Welcome to server! \nPlease LOGIN to continue. Usage: LOGIN <username> <>
+        char *welcome_msg = "Welcome to server! \nPlease LOGIN to continue. Usage: LOGIN <username> <password>\n";
         SSL_write(ssl, welcome_msg, strlen(welcome_msg));
 
 //conversation loop with bot
@@ -143,9 +185,8 @@ void *handle_client(void *client_socket_ptr){
 
                 if (bytes_read > 0) {
                 buffer[bytes_read] = '\0';
-//check rate lomitng
+//check rate limiting
                 time_t current_time = time(NULL);
-                printf("[Socket %d]: %s", new_socket, buffer);
 
                 if (current_time - window_start >= 1){
 //if more than 1 second
@@ -154,44 +195,46 @@ void *handle_client(void *client_socket_ptr){
                 }else{
                         message_count++;
                         if (message_count > MAX_REQUESTS_PER_SEC){
-                                snprintf(log_buff, sizeof(log_buff), "SECURITY ALERT: Socket %d excee>
-                                ,new_socket, message_count);
+                                snprintf(log_buff, sizeof(log_buff), "SECURITY ALERT: Client %s exceeded rate limit (%d requests/sec). Connection dropped.",
+                                         peer, message_count);
                                 log_event("WARNING", log_buff);
 
-                                char *err_msg = "HTTP/1.1 429 Too Many Requests\nRate limit exceeded.>
+                                char *err_msg = "HTTP/1.1 429 Too Many Requests\nRate limit exceeded. Connection closed.\n";
                                 SSL_write(ssl, err_msg, strlen(err_msg));
                                 break;
                         }
                 }
-//comand login
+//command login
 
                 if (strncmp(buffer, "LOGIN ", 6) == 0){
                         char username[64] = {0};
                         char password[64] = {0};
 
                         pthread_mutex_lock(&auth_lock_mutex);
+                        ip_record_t *rec = get_ip_record(info.ip);
                         time_t now = time(NULL); //getting current time
-                        //checking max tries
-                        if(failed_attempts >= MAX_FAILED_ATTEMPTS){
-                                //cac how many seconds left out of 30
-                                double seconds_left = LOCKOUT_TIME_SEC - difftime(now, lockout_start_>
+                        //checking max tries for this IP
+                        if(rec->failed_attempts >= MAX_FAILED_ATTEMPTS){
+                                //calc how many seconds left out of 30
+                                double seconds_left = LOCKOUT_TIME_SEC - difftime(now, rec->lockout_start_time);
 
-                                if (seconds_left >0 ){
+                                if (seconds_left > 0){
                                         pthread_mutex_unlock(&auth_lock_mutex);
                                         char reply[128];
-                                     snprintf(reply, sizeof(reply), "Account locked due to mutiple>
-                                                ,seconds_left);
+                                        snprintf(reply, sizeof(reply), "Account locked due to multiple failed attempts. Try again in %.0f seconds.\n",
+                                                 seconds_left);
                                         SSL_write(ssl, reply, strlen(reply));
 
-                                        snprintf(log_buff, sizeof(log_buff), "SECURITY ALLERT: Reject>
+                                        snprintf(log_buff, sizeof(log_buff), "SECURITY ALERT: Rejected login from %s - source is LOCKED", peer);
                                         log_event("WARNING", log_buff);
 
                                         continue;
                                 }else{
                                 // after 30 seconds- reset
-                                failed_attempts = 0;
-                                lockout_start_time = 0;
-                                log_event("INFO", "Lockout period expierd. Accound now is unlocked");
+                                rec->failed_attempts = 0;
+                                rec->lockout_start_time = 0;
+                                snprintf(log_buff, sizeof(log_buff), "Lockout period expired for %s. Login unlocked", info.ip);
+                                log_event("INFO", log_buff);
                                 }
                         }
                         pthread_mutex_unlock(&auth_lock_mutex);
@@ -201,43 +244,36 @@ void *handle_client(void *client_socket_ptr){
                                 username[strcspn(username, "\r\n")] = 0;
 
                                 char computed_hash[65] = {0};
-                                 computer_sha256_with_salt(password,SALT, computed_hash);
+                                compute_sha256_with_salt(password, SALT, computed_hash);
 
-
-
-                                        printf("\n[DEBUG] Username received: '%s'\n", username);
-                                        printf("[DEBUG] Salt used: '%s'\n", SALT);
-                                        printf("[DEBUG] Salted Computed Hash: '%s'\n", computed_hash);
-                                        printf("[DEBUG] Expected Hash: '%s'\n\n", VALID_PASSWORD_HASH>
-
-
-
-                                if (strcmp(username, VALID_USERNAME) == 0 && strcmp(computed_hash,VAL>
-                                        //reset when connection succsided
+                                if (strcmp(username, VALID_USERNAME) == 0 && strcmp(computed_hash, VALID_PASSWORD_HASH) == 0){
+                                        //reset when login succeeded
                                         pthread_mutex_lock(&auth_lock_mutex);
-                                        failed_attempts = 0;
+                                        get_ip_record(info.ip)->failed_attempts = 0;
                                         pthread_mutex_unlock(&auth_lock_mutex);
 
                                         is_authenticated = 1;
                                         char *reply = "200 SUCCESS: Authenticated successfully!\n";
                                         SSL_write(ssl, reply, strlen(reply));
 
-                                        snprintf(log_buff, sizeof(log_buff), "User '%s' authenticated>
+                                        snprintf(log_buff, sizeof(log_buff), "User '%s' authenticated successfully from %s", username, peer);
                                         log_event("INFO", log_buff);
                                 }else{
                                         // dealing with failed attempts
-                                   pthread_mutex_lock(&auth_lock_mutex);
-                                        failed_attempts++;
+                                        pthread_mutex_lock(&auth_lock_mutex);
+                                        ip_record_t *r = get_ip_record(info.ip);
+                                        r->failed_attempts++;
+                                        int attempts = r->failed_attempts;
 
                                         //check if lock
-                                        if (failed_attempts >= MAX_FAILED_ATTEMPTS){
-                                                lockout_start_time = time(NULL);
-                                                snprintf(log_buff, sizeof(log_buff), "SECURITY ALERT:>
-                                                         MAX_FAILED_ATTEMPTS, LOCKOUT_TIME_SEC);
+                                        if (attempts >= MAX_FAILED_ATTEMPTS){
+                                                r->lockout_start_time = time(NULL);
+                                                snprintf(log_buff, sizeof(log_buff), "SECURITY ALERT: %d failed login attempts from %s (last user '%s'). Source LOCKED for %d seconds",
+                                                         MAX_FAILED_ATTEMPTS, peer, username, LOCKOUT_TIME_SEC);
                                                 log_event("WARNING", log_buff);
                                         }else{
-                                        snprintf(log_buff,sizeof(log_buff),"SECURITY WARNING: Failed >
-                                                         failed_attempts, MAX_FAILED_ATTEMPTS, userna>
+                                        snprintf(log_buff,sizeof(log_buff),"SECURITY WARNING: Failed login attempt (%d/%d) for user '%s' from %s",
+                                                         attempts, MAX_FAILED_ATTEMPTS, username, peer);
                                         log_event("WARNING", log_buff);
                                         }
                                         pthread_mutex_unlock(&auth_lock_mutex);
@@ -245,8 +281,8 @@ void *handle_client(void *client_socket_ptr){
                                         is_authenticated = 0;
                                         char reply[128];
                                         //showing how many attempts
-                                        snprintf(reply, sizeof(reply), "401 UNAUTHORIZED: Invalid cre>
-                                                         failed_attempts, MAX_FAILED_ATTEMPTS);
+                                        snprintf(reply, sizeof(reply), "401 UNAUTHORIZED: Invalid credentials! Attempt %d/%d\n",
+                                                         attempts, MAX_FAILED_ATTEMPTS);
                                         SSL_write(ssl, reply, strlen(reply));
                                 }
                         } else{
@@ -272,7 +308,13 @@ void *handle_client(void *client_socket_ptr){
                         char *reply = "Server time: Active Multi-Threaded Session!\n";
                         SSL_write(ssl, reply, strlen(reply));
                 }
-              break;
+
+            } else if (strncmp(buffer, "EXIT", 4) == 0) {
+                char *reply = "Goodbye!\n";
+                SSL_write(ssl, reply, strlen(reply));
+                snprintf(log_buff, sizeof(log_buff), "Client %s sent EXIT. Closing connection", peer);
+                log_event("INFO", log_buff);
+                break;
 
             } else {
                 char *reply = "Unknown command. Try PING, TIME, or EXIT.\n";
@@ -280,11 +322,12 @@ void *handle_client(void *client_socket_ptr){
             }
 
         } else if (bytes_read == 0) {
-                snprintf(log_buff, sizeof(log_buff),"Socket %d disconnected gracefully.\n", new_socke>
+                snprintf(log_buff, sizeof(log_buff),"Client %s disconnected gracefully.", peer);
                 log_event("INFO", log_buff);
                 break;
         } else {
-            perror("Recv failed");
+            snprintf(log_buff, sizeof(log_buff), "Connection error with client %s", peer);
+            log_event("WARNING", log_buff);
             break;
         }
     }
@@ -294,8 +337,8 @@ void *handle_client(void *client_socket_ptr){
         close(new_socket);
         pthread_mutex_lock(&clients_mutex);
         active_clients--;
-        snprintf(log_buff, sizeof(log_buff),"[-] [Thread %ld] Client disconnected. Active clients con>
- (long)pthread_self(), active_clients);
+        snprintf(log_buff, sizeof(log_buff),"[-] [Thread %lu] Client %s disconnected. Active clients: %d",
+                 (unsigned long)pthread_self(), peer, active_clients);
         log_event("INFO", log_buff);
         pthread_mutex_unlock(&clients_mutex);
 
@@ -305,18 +348,20 @@ void *handle_client(void *client_socket_ptr){
 int main(){
         int server_fd;
         struct sockaddr_in address;
-        log_event("INFO", "Startig Multi-Thread Cyber Server...");
+        //a client that disconnects mid-write must not kill the whole server
+        signal(SIGPIPE, SIG_IGN);
+        log_event("INFO", "Starting Multi-Thread Secure SSL/TLS Cyber Server...");
 
         SSL_library_init();
         OpenSSL_add_all_algorithms();
         SSL_load_error_strings();
 
-        ssl_ctx = create_ssl_contex();
+        ssl_ctx = create_ssl_context();
         configure_ssl_context(ssl_ctx);
 
 // create the socket
         server_fd = socket(AF_INET, SOCK_STREAM,0);
-        if (server_fd == 0){
+        if (server_fd < 0){
                 perror("Socket failed");
                 exit(EXIT_FAILURE);
         }
@@ -334,8 +379,6 @@ int main(){
                 close(server_fd);
                 exit(EXIT_FAILURE);
         }
-        printf("[*] Multi-threaded server listing on port %d...\n", PORT);
-
 
 // Listen
         if (listen(server_fd, 10) < 0) {
@@ -344,29 +387,36 @@ int main(){
                 exit(EXIT_FAILURE);
         }
         char start_log[128];
-        snprintf(start_log, sizeof(start_log), "Multi-threaded server listening on port %d...\n", POR>
+        snprintf(start_log, sizeof(start_log), "Multi-threaded server listening on port %d...", PORT);
         log_event("INFO", start_log);
 
-//CREATING THREATS LOOP
+//CREATING THREADS LOOP
         while (1){
-
-                socklen_t addrlen = sizeof(address);
-               int new_socket = accept(server_fd, (struct sockaddr *)&address, &addrlen);
+                struct sockaddr_in client_addr; //separate struct so the server address is not overwritten
+                socklen_t addrlen = sizeof(client_addr);
+                int new_socket = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
                 if (new_socket < 0){
                         perror("Accept failed");
                         continue;//keep listen after no connect
                 }
-                printf("\n[+] New connection accepted! Creating thread...\n");
 
-//use pointers with another client
-                int *new_sock_ptr = malloc(sizeof(int));
-                *new_sock_ptr = new_socket;
+//pass socket + client IP/port to the thread
+                client_info_t *info = malloc(sizeof(client_info_t));
+                if (info == NULL){
+                        close(new_socket);
+                        continue;
+                }
+                info->sock = new_socket;
+                inet_ntop(AF_INET, &client_addr.sin_addr, info->ip, sizeof(info->ip));
+                info->port = ntohs(client_addr.sin_port);
 
                 pthread_t thread_id;
-                if (pthread_create(&thread_id, NULL, handle_client, (void*) new_sock_ptr) <0){
+                //pthread_create returns 0 on success, an error number otherwise
+                if (pthread_create(&thread_id, NULL, handle_client, (void*) info) != 0){
                         perror("Could not create thread");
-                        free(new_sock_ptr);
+                        free(info);
                         close(new_socket);
+                        continue;
                 }
 
                 pthread_detach(thread_id);
@@ -377,5 +427,3 @@ SSL_CTX_free(ssl_ctx);
 return 0;
 
 }
-
-
