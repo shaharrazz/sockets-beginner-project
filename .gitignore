@@ -1,0 +1,7 @@
+server.key
+server.crt
+server.log
+server_multi
+server
+client
+*.o
